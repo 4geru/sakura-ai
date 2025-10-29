@@ -1,0 +1,8 @@
+{
+  "enabledMcpjsonServers": [
+    "line-bot",
+    "sakura-docquery-mcp",
+    "bak"
+  ],
+  "enableAllProjectMcpServers": true
+}
