@@ -1,80 +1,72 @@
+/**
+ * Sakura AI Documents Query Tool
+ * Query Sakura AI vector store for relevant documents
+ */
+
 import { Tool } from '@mastra/core/tools';
 import { z } from 'zod';
-
-const API_BASE = process.env.SAKURA_AI_BASE_URL || "https://api.ai.sakura.ad.jp/v1";
-const TOKEN = process.env.SAKURA_AI_TOKEN;
-
-async function httpJson(url: string, opts: any = {}) {
-  const controller = new AbortController();
-  const timeoutMs = opts.timeoutMs ?? 30000;
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  
-  try {
-    const res = await fetch(url, {
-      ...opts,
-      headers: {
-        Accept: "application/json",
-        Authorization: `Bearer ${TOKEN}`,
-        ...(opts.headers || {}),
-      },
-      signal: controller.signal,
-    });
-    
-    const text = await res.text();
-    if (!res.ok) {
-      throw new Error(`HTTP ${res.status} ${res.statusText}\n${text?.slice(0, 2000) || ""}`);
-    }
-    
-    if (!text) return {};
-    
-    try {
-      return JSON.parse(text);
-    } catch {
-      throw new Error(`Failed to parse JSON:\n${text?.slice(0, 2000)}`);
-    }
-  } finally {
-    clearTimeout(timer);
-  }
-}
+import { httpJson, validateToken, getApiBase } from '../utils/sakura-http';
 
 export const sakuraDocsQueryTool = new Tool({
   id: 'sakura_documents_query',
   description: 'Query Sakura AI vector store for relevant documents',
+
   inputSchema: z.object({
     query: z.string().min(1).describe('The search query to find relevant documents'),
     tags: z.array(z.string()).optional().describe('Optional tags to filter documents'),
     topK: z.number().int().positive().max(50).default(5).describe('Number of results to return (max 50)'),
-    timeoutMs: z.number().int().positive().max(120000).default(30000).describe('Request timeout in milliseconds'),
+    timeoutMs: z.number().int().positive().max(120000).default(30000).describe('Request timeout in milliseconds (default: 30000)'),
+    maxRetries: z.number().int().min(0).max(5).default(3).describe('Maximum number of retry attempts for failed requests (default: 3)'),
+    retryDelay: z.number().int().positive().max(10000).default(2000).describe('Initial delay between retries in milliseconds (default: 2000)'),
   }),
-  
+
   execute: async (params) => {
-    // Extract from context if available (new Mastra format), fallback to direct params
+    // ========================================
+    // 1. Extract and validate parameters
+    // ========================================
     const context = params.context || params;
-    const { query, tags, topK = 5, timeoutMs = 30000 } = context;
-    
-    if (!TOKEN) {
-      throw new Error("SAKURA_AI_TOKEN environment variable is required");
-    }
-    
+    const {
+      query,
+      tags,
+      topK = 5,
+      timeoutMs = 30000,
+      maxRetries = 3,
+      retryDelay = 2000
+    } = context;
+
+    validateToken();
+
     if (!query || typeof query !== 'string' || query.trim().length === 0) {
       throw new Error("Query parameter is required and must be a non-empty string");
     }
 
-    const payload = { 
-      query: query.trim(), 
-      ...(Array.isArray(tags) && tags.length ? { tags } : {}) 
+    // ========================================
+    // 2. Build request payload
+    // ========================================
+    const payload = {
+      query: query.trim(),
+      ...(Array.isArray(tags) && tags.length ? { tags } : {})
     };
-    
-    const url = `${API_BASE}/documents/query/`;
-    
+
+    // ========================================
+    // 3. Make API request
+    // ========================================
+    const url = `${getApiBase()}/documents/query/`;
+
     const json = await httpJson(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
       timeoutMs,
+      maxRetries,
+      retryDelay,
     });
 
+    // ========================================
+    // 4. Process response
+    // ========================================
     const candidates = json?.results || json?.documents || json?.matches || json?.items || [];
+
     const toText = (it: any) =>
       it?.text ?? it?.content ?? it?.chunk ?? it?.document?.text ?? it?.document?.content ?? "";
 
@@ -88,9 +80,13 @@ export const sakuraDocsQueryTool = new Tool({
       }))
       .filter((n: any) => n.text);
 
+    // Sort by score and limit to topK
     normalized.sort((a: any, b: any) => (b.score ?? 0) - (a.score ?? 0));
     normalized = normalized.slice(0, topK);
 
+    // ========================================
+    // 5. Build summary
+    // ========================================
     const brief = normalized.map((n: any, i: number) => ({
       idx: i + 1,
       id: n.id,
@@ -99,7 +95,7 @@ export const sakuraDocsQueryTool = new Tool({
       textHead: n.text.slice(0, 160),
     }));
 
-    const header =
+    const summary =
       "Top document matches:\n" +
       (brief.length
         ? brief
@@ -109,10 +105,13 @@ export const sakuraDocsQueryTool = new Tool({
             .join("\n")
         : "(no results)");
 
+    // ========================================
+    // 6. Return structured response
+    // ========================================
     return {
       success: true,
       data: {
-        summary: header,
+        summary,
         topK,
         documents: normalized,
         totalFound: candidates.length,
